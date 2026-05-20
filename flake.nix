@@ -54,6 +54,11 @@
             ten-vad
           ]
         );
+
+        typelibPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
+          pkgs.gtk3
+          pkgs.libayatana-appindicator
+        ];
       in
       {
         packages.default = pkgs.stdenvNoCC.mkDerivation {
@@ -91,6 +96,7 @@
             makeWrapper ${pythonEnv}/bin/python $out/bin/parakeet-dictation \
               "''${gappsWrapperArgs[@]}" \
               --add-flags "$out/share/parakeet-dictation/dictation_app.py" \
+              --prefix GI_TYPELIB_PATH : ${typelibPath} \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   pkgs.wl-clipboard
