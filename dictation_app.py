@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -115,6 +116,10 @@ class AppConfig:
 
     # Strip filler words ("um", "uh", "ehm" …) before injecting text
     filter_fillers: bool = True
+
+    # Load the recognizer in the background at startup so push-to-talk can
+    # begin listening quickly on slower laptops.
+    preload_model: bool = True
 
     # Language (for models that support it, e.g. Canary)
     language: str = "en"
@@ -541,11 +546,17 @@ class ASREngine:
         self._on_partial_type = on_partial_type or (lambda t: None)
         self._on_commit_partial = on_commit_partial or (lambda t: None)
         self._running = False
+        self._starting = False
         self._paused = False
         self._thread = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()  # set = NOT paused
         self._pause_event.set()
+        self._recognizer = None
+        self._recognizer_lock = threading.Lock()
+        self._session_started_at = None
+        if self._config.preload_model:
+            threading.Thread(target=self._preload_recognizer, daemon=True).start()
 
     def _get_model_dir(self) -> Path:
         return MODELS_DIR / self._config.model_profile
@@ -635,31 +646,64 @@ class ASREngine:
             sample_rate=SAMPLE_RATE,
         )
 
+    def _build_recognizer(self):
+        if self._profile.get("streaming", False):
+            return self._build_online_recognizer()
+        return self._build_offline_recognizer()
+
+    def _get_recognizer(self):
+        with self._recognizer_lock:
+            if self._recognizer is not None:
+                return self._recognizer
+
+            started_at = time.monotonic()
+            print("Loading ASR model...", flush=True)
+            self._ensure_models()
+            self._recognizer = self._build_recognizer()
+            elapsed = time.monotonic() - started_at
+            print(f"ASR model loaded in {elapsed:.2f}s.", flush=True)
+            return self._recognizer
+
+    def _preload_recognizer(self):
+        try:
+            print("Preloading ASR model...", flush=True)
+            self._get_recognizer()
+        except Exception as e:
+            GLib.idle_add(self._on_error, str(e))
+
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_starting(self) -> bool:
+        return self._starting
 
     @property
     def is_paused(self) -> bool:
         return self._paused
 
     def start(self):
-        if self._running:
+        if self._running or self._starting:
             return
+        print("ASR start requested.", flush=True)
         self._stop_event.clear()
         self._pause_event.set()
         self._paused = False
+        self._starting = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
-        if not self._running:
+        if not self._running and not self._starting:
             return
+        print("ASR stop requested.", flush=True)
         self._stop_event.set()
         self._pause_event.set()
         if self._thread:
             self._thread.join(timeout=5)
         self._running = False
+        self._starting = False
         self._paused = False
 
     def pause(self):
@@ -677,14 +721,21 @@ class ASREngine:
             GLib.idle_add(self._on_partial, "Paused")
 
     def _run(self):
+        self._session_started_at = time.monotonic()
         try:
-            self._ensure_models()
+            self._get_recognizer()
         except Exception as e:
+            self._starting = False
             GLib.idle_add(self._on_error, str(e))
+            return
+
+        if self._stop_event.is_set():
+            self._starting = False
             return
 
         is_streaming = self._profile.get("streaming", False)
         self._running = True
+        self._starting = False
 
         try:
             if is_streaming:
@@ -695,10 +746,11 @@ class ASREngine:
             GLib.idle_add(self._on_error, str(e))
         finally:
             self._running = False
+            self._starting = False
             play_beep_stop(self._config.beep_volume)
 
     def _run_offline(self):
-        recognizer = self._build_offline_recognizer()
+        recognizer = self._get_recognizer()
         vad = self._build_vad()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
@@ -709,6 +761,9 @@ class ASREngine:
             blocksize=samples_per_chunk,
         ) as stream:
             play_beep_start(self._config.beep_volume)
+            if self._session_started_at:
+                elapsed = time.monotonic() - self._session_started_at
+                print(f"ASR listening after {elapsed:.2f}s.", flush=True)
             GLib.idle_add(self._on_partial, "")
 
             while not self._stop_event.is_set():
@@ -750,7 +805,7 @@ class ASREngine:
                 vad.pop()
 
     def _run_streaming(self):
-        recognizer = self._build_online_recognizer()
+        recognizer = self._get_recognizer()
         stream = recognizer.create_stream()
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
@@ -762,6 +817,9 @@ class ASREngine:
             blocksize=samples_per_chunk,
         ) as mic:
             play_beep_start(self._config.beep_volume)
+            if self._session_started_at:
+                elapsed = time.monotonic() - self._session_started_at
+                print(f"ASR listening after {elapsed:.2f}s.", flush=True)
             GLib.idle_add(self._on_partial, "")
 
             while not self._stop_event.is_set():
@@ -829,6 +887,10 @@ class DictationController:
     @property
     def is_running(self) -> bool:
         return self._engine.is_running
+
+    @property
+    def is_starting(self) -> bool:
+        return self._engine.is_starting
 
     @property
     def is_paused(self) -> bool:
@@ -958,7 +1020,10 @@ class ControlServer:
                     break
                 with conn:
                     response = self._handle_connection(conn)
-                    conn.sendall((response + "\n").encode("utf-8"))
+                    try:
+                        conn.sendall((response + "\n").encode("utf-8"))
+                    except BrokenPipeError:
+                        pass
 
     def _handle_connection(self, conn) -> str:
         try:
@@ -967,6 +1032,8 @@ class ControlServer:
             return "error empty command"
         command = command.lower()
         if command == "status":
+            if self._controller.is_starting:
+                return "starting"
             if self._controller.is_running:
                 return "running paused" if self._controller.is_paused else "running"
             return "idle"
