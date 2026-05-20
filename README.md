@@ -135,12 +135,14 @@ The app runs as a **system tray indicator** with an optional **full-size main wi
 | Toggle | `Ctrl+0` | Start/stop dictation |
 | Start | `Ctrl+9` | Start only (start/stop mode) |
 | Stop | `Ctrl+8` | Stop only (start/stop mode) |
+| Push-to-talk | `Right Ctrl`, `AltGr` / `Right Alt` | Hold to dictate; release to stop |
 | Pause | `Ctrl+Alt+0` | Pause/resume without stopping engine |
 
 ### Hotkey modes
 
 - **Toggle mode** (default): One key starts and stops dictation
 - **Start/Stop mode**: Separate keys for starting and stopping
+- **Push-to-talk mode**: Holding any configured key starts dictation; releasing the last held key stops it
 
 All hotkeys are rebindable from **Settings > Hotkeys**.
 
@@ -191,6 +193,7 @@ Settings stored in `~/.config/parakeet-dictation/config.json`:
   "hotkey_start": "<ctrl>+9",
   "hotkey_stop": "<ctrl>+8",
   "hotkey_pause": "<ctrl>+<alt>+0",
+  "hotkey_push_to_talk": ["<ctrl_r>", "<alt_gr>", "<alt_r>"],
   "night_mode": false,
   "night_start": 22,
   "night_end": 9

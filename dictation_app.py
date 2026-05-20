@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -31,8 +31,13 @@ from gi.repository import AyatanaAppIndicator3, GLib, Gtk, Gdk
 
 APP_NAME = "Parakeet Dictation"
 APP_ID = "parakeet-dictation"
-CONFIG_DIR = Path.home() / ".config" / APP_ID
-CONFIG_FILE = CONFIG_DIR / "config.json"
+CONFIG_FILE = Path(
+    os.environ.get(
+        "PARAKEET_CONFIG_FILE",
+        str(Path.home() / ".config" / APP_ID / "config.json"),
+    )
+).expanduser()
+CONFIG_DIR = CONFIG_FILE.parent
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_ID
 MODELS_DIR = DATA_DIR / "models"
@@ -84,7 +89,8 @@ class AppConfig:
     #   "wtype" (needs virtual-keyboard protocol), "ydotool" (needs daemon+uinput)
     typer: str = "clipboard"
 
-    # Hotkey mode: "toggle" (one key) or "start_stop" (separate keys)
+    # Hotkey mode: "toggle" (one key), "start_stop" (separate keys),
+    # or "push_to_talk" (hold any configured key to dictate).
     hotkey_mode: str = "toggle"
 
     # Night mode — suppress beeps between these hours (24h format)
@@ -108,6 +114,9 @@ class AppConfig:
     hotkey_start: str = "<ctrl>+9"
     hotkey_stop: str = "<ctrl>+8"
     hotkey_pause: str = "<ctrl>+<alt>+0"
+    hotkey_push_to_talk: list[str] = field(
+        default_factory=lambda: ["<ctrl_r>", "<alt_gr>", "<alt_r>"]
+    )
 
     def save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,16 +124,91 @@ class AppConfig:
 
     @staticmethod
     def load() -> "AppConfig":
+        env_defaults = {}
+        if os.environ.get("PARAKEET_DEFAULT_CONFIG"):
+            try:
+                env_defaults = json.loads(os.environ["PARAKEET_DEFAULT_CONFIG"])
+            except Exception:
+                env_defaults = {}
+
+        config = AppConfig(**{
+            k: v for k, v in env_defaults.items()
+            if k in AppConfig.__dataclass_fields__
+        })
+
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text())
-                return AppConfig(**{
+                config = AppConfig(**{
                     k: v for k, v in data.items()
                     if k in AppConfig.__dataclass_fields__
                 })
             except Exception:
                 pass
-        return AppConfig()
+
+        if isinstance(config.hotkey_push_to_talk, str):
+            config.hotkey_push_to_talk = [
+                key.strip()
+                for key in config.hotkey_push_to_talk.split(",")
+                if key.strip()
+            ]
+        if config.hotkey_mode not in ("toggle", "start_stop", "push_to_talk"):
+            config.hotkey_mode = "toggle"
+        return config
+
+
+def _split_key_list(value) -> list[str]:
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = value or []
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _display_key_list(value) -> str:
+    return ", ".join(_split_key_list(value))
+
+
+def _activation_label(config: AppConfig, start: bool = True) -> str:
+    if config.hotkey_mode == "push_to_talk":
+        return _display_key_list(config.hotkey_push_to_talk)
+    if config.hotkey_mode == "toggle":
+        return config.hotkey_toggle
+    return config.hotkey_start if start else config.hotkey_stop
+
+
+def _canonicalize_push_key_name(value: str) -> str:
+    key = value.strip().lower()
+    key = key.replace("key.", "")
+    key = key.replace("<", "").replace(">", "")
+    key = key.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "control_r": "ctrl_r",
+        "right_control": "ctrl_r",
+        "right_ctrl": "ctrl_r",
+        "rctrl": "ctrl_r",
+        "ctrlright": "ctrl_r",
+        "altgr": "alt_gr",
+        "iso_level3_shift": "alt_gr",
+        "level3": "alt_gr",
+        "option_r": "alt_r",
+        "right_option": "alt_r",
+        "right_alt": "alt_r",
+        "ralt": "alt_r",
+        "altright": "alt_r",
+    }
+    return aliases.get(key, key)
+
+
+def _key_event_name(key) -> str:
+    name = getattr(key, "name", None)
+    if name:
+        return _canonicalize_push_key_name(name)
+    char = getattr(key, "char", None)
+    if char:
+        return _canonicalize_push_key_name(char)
+    return _canonicalize_push_key_name(str(key))
 
 
 def load_model_profiles() -> dict:
@@ -828,9 +912,31 @@ class HotkeyManager:
         self._on_stop = on_stop
         self._on_pause = on_pause
         self._listener = None
+        self._ptt_keys = set()
+        self._ptt_pressed = set()
+        self._ptt_lock = threading.Lock()
 
     def start(self):
         from pynput import keyboard
+
+        if self._config.hotkey_mode == "push_to_talk":
+            self._ptt_keys = {
+                _canonicalize_push_key_name(key)
+                for key in _split_key_list(self._config.hotkey_push_to_talk)
+            }
+            self._ptt_pressed = set()
+            if not self._ptt_keys:
+                print("Push-to-talk mode enabled, but no push-to-talk keys are configured.",
+                      file=sys.stderr)
+                return
+            self._listener = keyboard.Listener(
+                on_press=self._on_ptt_press,
+                on_release=self._on_ptt_release,
+            )
+            self._listener.daemon = True
+            self._listener.start()
+            return
+
         bindings = {}
         if self._config.hotkey_mode == "toggle":
             bindings[self._config.hotkey_toggle] = lambda: GLib.idle_add(self._on_toggle)
@@ -845,10 +951,39 @@ class HotkeyManager:
         self._listener.daemon = True
         self._listener.start()
 
+    def _on_ptt_press(self, key):
+        key_name = _key_event_name(key)
+        if key_name not in self._ptt_keys:
+            return
+        should_start = False
+        with self._ptt_lock:
+            if key_name not in self._ptt_pressed:
+                should_start = not self._ptt_pressed
+                self._ptt_pressed.add(key_name)
+        if should_start:
+            GLib.idle_add(self._on_start)
+
+    def _on_ptt_release(self, key):
+        key_name = _key_event_name(key)
+        if key_name not in self._ptt_keys:
+            return
+        should_stop = False
+        with self._ptt_lock:
+            self._ptt_pressed.discard(key_name)
+            should_stop = not self._ptt_pressed
+        if should_stop:
+            GLib.idle_add(self._on_stop)
+
     def stop(self):
+        was_push_to_talk = self._config.hotkey_mode == "push_to_talk"
+        had_pressed_key = bool(self._ptt_pressed)
         if self._listener:
             self._listener.stop()
             self._listener = None
+        with self._ptt_lock:
+            self._ptt_pressed = set()
+        if was_push_to_talk and had_pressed_key:
+            GLib.idle_add(self._on_stop)
 
     def rebuild(self, config: AppConfig):
         self._config = config
@@ -1398,10 +1533,15 @@ class SettingsDialog(Gtk.Dialog):
             None, "Toggle (one key starts and stops)")
         self._mode_startstop = Gtk.RadioButton.new_with_label_from_widget(
             self._mode_toggle, "Start/Stop (separate keys)")
+        self._mode_push_to_talk = Gtk.RadioButton.new_with_label_from_widget(
+            self._mode_toggle, "Push-to-talk (hold key to dictate)")
         if self._config.hotkey_mode == "start_stop":
             self._mode_startstop.set_active(True)
+        elif self._config.hotkey_mode == "push_to_talk":
+            self._mode_push_to_talk.set_active(True)
         box.pack_start(self._mode_toggle, False, False, 0)
         box.pack_start(self._mode_startstop, False, False, 4)
+        box.pack_start(self._mode_push_to_talk, False, False, 4)
 
         # Bindings
         hint = Gtk.Label(label="Click a button, then press your desired key combo.")
@@ -1428,6 +1568,12 @@ class SettingsDialog(Gtk.Dialog):
         self._hk_pause = HotkeyCaptureButton(self._config.hotkey_pause)
         grid.attach(self._hk_pause, 1, 3, 1, 1)
 
+        grid.attach(Gtk.Label(label="Push-to-talk:", halign=Gtk.Align.END), 0, 4, 1, 1)
+        self._hk_push_to_talk = Gtk.Entry()
+        self._hk_push_to_talk.set_text(_display_key_list(self._config.hotkey_push_to_talk))
+        self._hk_push_to_talk.set_placeholder_text("<ctrl_r>, <alt_gr>, <alt_r>")
+        grid.attach(self._hk_push_to_talk, 1, 4, 1, 1)
+
         box.pack_start(grid, False, False, 0)
 
         # Save
@@ -1440,11 +1586,17 @@ class SettingsDialog(Gtk.Dialog):
         return box
 
     def _save_hotkeys(self, _btn):
-        self._config.hotkey_mode = "start_stop" if self._mode_startstop.get_active() else "toggle"
+        if self._mode_push_to_talk.get_active():
+            self._config.hotkey_mode = "push_to_talk"
+        elif self._mode_startstop.get_active():
+            self._config.hotkey_mode = "start_stop"
+        else:
+            self._config.hotkey_mode = "toggle"
         self._config.hotkey_toggle = self._hk_toggle.binding
         self._config.hotkey_start = self._hk_start.binding
         self._config.hotkey_stop = self._hk_stop.binding
         self._config.hotkey_pause = self._hk_pause.binding
+        self._config.hotkey_push_to_talk = _split_key_list(self._hk_push_to_talk.get_text())
         self._config.save()
         if self._on_save:
             self._on_save(self._config)
@@ -1847,7 +1999,7 @@ class TrayIcon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        self._toggle_item = Gtk.MenuItem(label=f"Start Dictation ({cfg.hotkey_toggle})")
+        self._toggle_item = Gtk.MenuItem(label=f"Start Dictation ({_activation_label(cfg)})")
         self._toggle_item.connect("activate", self._on_toggle)
         menu.append(self._toggle_item)
 
@@ -1921,12 +2073,12 @@ class TrayIcon:
                 self._toggle_item.set_label("Resume Dictation")
                 self._indicator.set_icon_full("audio-input-microphone-muted", "Paused")
             else:
-                key = cfg.hotkey_toggle if cfg.hotkey_mode == "toggle" else cfg.hotkey_stop
+                key = _activation_label(cfg, start=False)
                 self._toggle_item.set_label(f"Stop Dictation ({key})")
                 self._indicator.set_icon_full("audio-input-microphone", "Listening")
             self._pause_item.set_sensitive(True)
         else:
-            key = cfg.hotkey_toggle if cfg.hotkey_mode == "toggle" else cfg.hotkey_start
+            key = _activation_label(cfg, start=True)
             self._toggle_item.set_label(f"Start Dictation ({key})")
             self._indicator.set_icon_full("audio-input-microphone-muted", "Idle")
             self._pause_item.set_sensitive(False)
@@ -2011,6 +2163,8 @@ def main():
     ).get("name", config.model_profile)
     if config.hotkey_mode == "toggle":
         mode_desc = f"Toggle: {config.hotkey_toggle}"
+    elif config.hotkey_mode == "push_to_talk":
+        mode_desc = f"Push-to-talk: {_display_key_list(config.hotkey_push_to_talk)}"
     else:
         mode_desc = f"Start: {config.hotkey_start}, Stop: {config.hotkey_stop}"
     print(f"{APP_NAME} running. {mode_desc}. Pause: {config.hotkey_pause}")
