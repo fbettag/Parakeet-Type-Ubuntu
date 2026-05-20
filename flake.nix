@@ -56,8 +56,15 @@
         );
 
         typelibPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
+          pkgs.at-spi2-core
+          pkgs.gdk-pixbuf
+          pkgs.glib
+          pkgs.gobject-introspection
           pkgs.gtk3
+          pkgs.harfbuzz
           pkgs.libayatana-appindicator
+          pkgs.libdbusmenu-gtk3
+          pkgs.pango
         ];
       in
       {
