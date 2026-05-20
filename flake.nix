@@ -66,6 +66,12 @@
           pkgs.libdbusmenu-gtk3
           pkgs.pango
         ];
+
+        runtimeLibraryPath = pkgs.lib.makeLibraryPath [
+          pkgs.llvmPackages.libcxx
+          pkgs.llvmPackages.libcxxabi
+          pkgs.llvmPackages.libunwind
+        ];
       in
       {
         packages.default = pkgs.stdenvNoCC.mkDerivation {
@@ -104,6 +110,7 @@
               "''${gappsWrapperArgs[@]}" \
               --add-flags "$out/share/parakeet-dictation/dictation_app.py" \
               --prefix GI_TYPELIB_PATH : ${typelibPath} \
+              --prefix LD_LIBRARY_PATH : ${runtimeLibraryPath} \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   pkgs.wl-clipboard
