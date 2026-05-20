@@ -69,7 +69,6 @@
 
         runtimeLibraryPath = pkgs.lib.makeLibraryPath [
           pkgs.llvmPackages.libcxx
-          pkgs.llvmPackages.libcxxabi
           pkgs.llvmPackages.libunwind
         ];
       in
