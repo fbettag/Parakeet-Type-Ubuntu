@@ -55,7 +55,7 @@
           ]
         );
 
-        typelibPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
+        typelibPath = pkgs.lib.makeSearchPathOutput "out" "lib/girepository-1.0" [
           pkgs.at-spi2-core
           pkgs.gdk-pixbuf
           pkgs.glib
