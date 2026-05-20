@@ -5,10 +5,12 @@ Supports multiple ASR model profiles (Parakeet, Canary, Nemotron) with
 configurable hotkeys and VAD-segmented or true streaming transcription.
 """
 
+import argparse
 import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +45,14 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"
 MODELS_DIR = DATA_DIR / "models"
 MODELS_JSON = APP_DIR / "models.json"
 SAMPLE_RATE = 16000
+
+
+def _control_socket_path() -> Path:
+    configured = os.environ.get("PARAKEET_CONTROL_SOCKET")
+    if configured:
+        return Path(configured).expanduser()
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    return runtime_dir / APP_ID / "control.sock"
 
 
 def _migrate_legacy_models():
@@ -895,9 +905,108 @@ class DictationController:
             self._status_callback(text)
 
     def _on_error(self, msg: str):
-        print(f"ERROR: {msg}", file=sys.stderr)
+        print(f"ERROR: {msg}", file=sys.stderr, flush=True)
         if self._status_callback:
             self._status_callback(f"Error: {msg[:60]}")
+
+
+# ---------------------------------------------------------------------------
+# Local control socket
+# ---------------------------------------------------------------------------
+
+class ControlServer:
+    def __init__(self, controller: DictationController, update_ui):
+        self._controller = controller
+        self._update_ui = update_ui
+        self._socket_path = _control_socket_path()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._socket_path.unlink(missing_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print(f"Control socket: {self._socket_path}", flush=True)
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(0.2)
+                client.connect(str(self._socket_path))
+                client.sendall(b"quit\n")
+        except OSError:
+            pass
+        if self._thread:
+            self._thread.join(timeout=1)
+            self._thread = None
+        self._socket_path.unlink(missing_ok=True)
+
+    def _run(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(self._socket_path))
+            os.chmod(self._socket_path, 0o600)
+            server.listen(8)
+            server.settimeout(0.5)
+            while not self._stop_event.is_set():
+                try:
+                    conn, _addr = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with conn:
+                    response = self._handle_connection(conn)
+                    conn.sendall((response + "\n").encode("utf-8"))
+
+    def _handle_connection(self, conn) -> str:
+        try:
+            command = conn.recv(1024).decode("utf-8").strip().splitlines()[0]
+        except Exception:
+            return "error empty command"
+        command = command.lower()
+        if command == "status":
+            if self._controller.is_running:
+                return "running paused" if self._controller.is_paused else "running"
+            return "idle"
+        if command == "quit":
+            return "ok stopping"
+        if command not in ("start", "stop", "toggle", "pause"):
+            return f"error unknown command: {command}"
+
+        print(f"Control command: {command}", flush=True)
+        GLib.idle_add(self._dispatch, command)
+        return f"ok {command}"
+
+    def _dispatch(self, command: str):
+        if command == "start":
+            self._controller.start()
+        elif command == "stop":
+            self._controller.stop()
+        elif command == "toggle":
+            self._controller.toggle()
+        elif command == "pause":
+            self._controller.pause()
+        if self._update_ui:
+            self._update_ui()
+        return False
+
+
+def send_control_command(command: str) -> int:
+    socket_path = _control_socket_path()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(socket_path))
+            client.sendall((command + "\n").encode("utf-8"))
+            response = client.recv(1024).decode("utf-8").strip()
+    except OSError as e:
+        print(f"ERROR: cannot reach {APP_NAME} at {socket_path}: {e}", file=sys.stderr)
+        return 2
+
+    print(response)
+    return 0 if not response.startswith("error") else 1
 
 
 # ---------------------------------------------------------------------------
@@ -2118,8 +2227,22 @@ class TrayIcon:
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument(
+        "--command",
+        choices=("start", "stop", "toggle", "pause", "status"),
+        help="Send a control command to the running tray service and exit.",
+    )
+    return parser.parse_args()
+
+
 def main():
     global _active_config
+    args = parse_args()
+    if args.command:
+        raise SystemExit(send_control_command(args.command))
+
     config = AppConfig.load()
     _active_config = config
 
@@ -2144,9 +2267,17 @@ def main():
 
     tray = TrayIcon(controller, hotkey_mgr, main_window)
     main_window._tray = tray  # So model changes from window rebuild tray menu
+    control_server = ControlServer(controller, tray.update_ui)
+    control_server.start()
     hotkey_mgr.start()
 
-    signal.signal(signal.SIGINT, lambda *_: (controller.stop(), Gtk.main_quit()))
+    def _quit(*_):
+        control_server.stop()
+        controller.stop()
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGINT, _quit)
+    signal.signal(signal.SIGTERM, _quit)
 
     # First-run: show welcome dialog if no models are downloaded
     profiles_data = controller.profiles_data
@@ -2167,10 +2298,11 @@ def main():
         mode_desc = f"Push-to-talk: {_display_key_list(config.hotkey_push_to_talk)}"
     else:
         mode_desc = f"Start: {config.hotkey_start}, Stop: {config.hotkey_stop}"
-    print(f"{APP_NAME} running. {mode_desc}. Pause: {config.hotkey_pause}")
-    print(f"Model: {profile_name} | Typer: {config.typer} | Threads: {config.num_threads}")
+    print(f"{APP_NAME} running. {mode_desc}. Pause: {config.hotkey_pause}", flush=True)
+    print(f"Model: {profile_name} | Typer: {config.typer} | Threads: {config.num_threads}", flush=True)
 
     Gtk.main()
+    control_server.stop()
     hotkey_mgr.stop()
 
 
